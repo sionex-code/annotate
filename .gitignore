@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.claude-annotations/
+*.log
+
+# machine-local runtime state (registered agents, per-agent prompts)
+agents.json
+
+# local scratch
+.fix-*
+.run-fix.ps1
+.schedule.ps1

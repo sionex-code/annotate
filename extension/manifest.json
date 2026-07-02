@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Annotator",
+  "version": "1.5.0",
+  "description": "Inspect elements, attach change requests, and send them to your AI coding agent (Claude, Codex, OpenCode, ...) with exact React component paths.",
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": [
+        "annotator.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}

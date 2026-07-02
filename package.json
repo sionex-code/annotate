@@ -1,0 +1,16 @@
+{
+  "name": "claude-annotator",
+  "version": "1.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension + Playwright launcher that sends visual element annotations (with exact React component paths) to your AI coding agent.",
+  "scripts": {
+    "start": "node launch.mjs",
+    "serve": "node server.mjs",
+    "build": "node build.mjs",
+    "install-skill": "node install.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.53.0"
+  }
+}
