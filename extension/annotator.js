@@ -9,6 +9,72 @@
   const PORT = window.__CLAUDE_ANNOTATOR_PORT || 4747;
   const BRIDGE = `http://localhost:${PORT}`;
 
+  // ---------------------------------------------------------------- bridge I/O
+  //
+  // This script runs in world MAIN (it has to, to read React fibers), so its
+  // own fetch() calls are subject to the PAGE's Content Security Policy — any
+  // app with a `connect-src`/`default-src` CSP blocks every request to the
+  // bridge (a different origin) and the status dot would never go green. So all
+  // bridge traffic is relayed to the isolated-world companion (bridge-proxy.js),
+  // which is governed by the extension's CSP + host permissions instead. If the
+  // proxy ever fails to answer (e.g. a page with no CSP, or the companion not
+  // yet loaded), we fall back to a direct fetch.
+
+  const bridgeRpc = new Map();
+  let bridgeRpcSeq = 0;
+  window.addEventListener('message', (e) => {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.__annotatorBridge !== 'response' || !bridgeRpc.has(d.id)) return;
+    const { resolve } = bridgeRpc.get(d.id);
+    bridgeRpc.delete(d.id);
+    resolve(d);
+  });
+
+  function proxyRequest(url, options) {
+    return new Promise((resolve) => {
+      const id = ++bridgeRpcSeq;
+      bridgeRpc.set(id, { resolve });
+      window.postMessage(
+        {
+          __annotatorBridge: 'request',
+          id,
+          url,
+          method: options?.method,
+          headers: options?.headers,
+          body: options?.body,
+        },
+        '*'
+      );
+      setTimeout(() => {
+        if (bridgeRpc.has(id)) {
+          bridgeRpc.delete(id);
+          resolve({ timeout: true });
+        }
+      }, 15000);
+    });
+  }
+
+  // fetch() replacement for bridge calls. Returns a minimal Response-like object
+  // ({ ok, status, json(), text() }); throws on network failure so callers'
+  // existing catch-blocks (which drop the green dot) keep working unchanged.
+  async function bridgeFetch(path, options = {}) {
+    const url = `${BRIDGE}${path}`;
+    const r = await proxyRequest(url, options);
+    if (!r.timeout && !r.netError) {
+      return {
+        ok: r.ok,
+        status: r.status,
+        json: async () => JSON.parse(r.text || 'null'),
+        text: async () => r.text || '',
+      };
+    }
+    // Proxy unavailable (no CSP-restricted page, or companion not ready) — a
+    // direct fetch works when the page CSP allows it, and throws when it does
+    // not (which the caller already handles the same as any bridge outage).
+    return fetch(url, options);
+  }
+
   const state = {
     inspecting: false,
     annotations: [], // { id, prompt, el, ...captured info }
@@ -175,6 +241,17 @@
   }
   #toolbar button:hover { background: #35323f; }
   #toolbar[hidden] { display: none; }
+  /* When dragged, the toolbar is positioned by explicit left/top instead of
+     the default bottom/right anchor. */
+  #toolbar.moved { right: auto; bottom: auto; }
+  #toolbar.dragging { user-select: none; cursor: grabbing; }
+  #btn-move {
+    display: flex; align-items: center; align-self: stretch; cursor: grab;
+    color: #6e6980; font-size: 15px; line-height: 1; padding: 0 2px 0 0;
+    touch-action: none;
+  }
+  #btn-move:hover { color: #b3a8ff; }
+  #toolbar.dragging #btn-move { cursor: grabbing; }
   #btn-hide { padding: 6px 8px; color: #9d98ad; }
   #btn-inspect.active, #btn-shot.active { background: #6d5ef2; border-color: #6d5ef2; color: #fff; }
   #fab {
@@ -279,15 +356,45 @@
   .st.failed { color: #f2545b; }
   .st.skipped { color: #e6b450; }
   .result-item .files { color: #9d98ad; font-size: 11px; margin-top: 2px; word-break: break-all; }
+  .result-agent { color: #b3a8ff; font-weight: 600; }
+  .result-model { color: #9d98ad; font-weight: 400; }
+  #settings {
+    position: fixed; bottom: 70px; right: 16px; width: 340px; max-height: 60vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    background: #1c1b22; color: #e8e6f0; border: 1px solid #3a3844; border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); font-size: 13px;
+  }
+  #settings[hidden] { display: none; }
+  #settings-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border-bottom: 1px solid #3a3844; font-weight: 700;
+  }
+  #settings-close { background: none; border: none; color: #9d98ad; cursor: pointer; font-size: 14px; padding: 0 2px; }
+  #settings-close:hover { color: #e8e6f0; }
+  #settings-list { overflow-y: auto; padding: 8px 12px; }
+  #settings-hint { color: #9d98ad; font-size: 11px; margin-bottom: 8px; }
+  .prompt-row { margin-bottom: 10px; }
+  .prompt-row label { display: block; color: #b3a8ff; font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+  .prompt-row textarea {
+    width: 100%; min-height: 44px; resize: vertical; background: #14131a; color: #e8e6f0;
+    border: 1px solid #3a3844; border-radius: 8px; padding: 6px 8px; font-size: 12px;
+  }
+  #settings-actions { display: flex; justify-content: flex-end; padding: 8px 12px; border-top: 1px solid #3a3844; }
+  #settings-save {
+    background: #6d5ef2; border: 1px solid #6d5ef2; color: #fff; font-weight: 600;
+    border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+  }
 </style>
 <div id="toolbar">
+  <span id="btn-move" title="Drag to move the toolbar">&#10303;</span>
   <span id="dot" title="Claude bridge status"></span>
   <button id="btn-inspect" title="Toggle annotate mode (Esc exits)">&#10021; Annotate</button>
-  <button id="btn-shot" title="Screenshots: when ON, sending also captures a page screenshot, and images pasted into the note form are attached">&#128247;</button>
+  <button id="btn-shot" title="Page screenshot: when ON, sending also attaches a full-page screenshot of the app (reference images you paste into a note are always sent, independent of this)">&#128247;</button>
   <span id="count">0</span>
   <select id="agent-select" title="Choose which agent to send to"></select>
   <button id="btn-send">Send &#10148;</button>
-  <button id="btn-results-toggle" title="Show changes Claude applied">&#10003;</button>
+  <button id="btn-results-toggle" title="Show recently applied changes (per batch: agent + model)">&#10003;</button>
+  <button id="btn-settings" title="Per-agent settings: standing instructions sent with every batch">&#9881;</button>
   <button id="btn-clear" title="Clear all annotations">&#10005;</button>
   <button id="btn-hide" title="Hide toolbar (Alt+Shift+A)">&#8722;</button>
 </div>
@@ -297,8 +404,8 @@
 <div id="pins"></div>
 <div id="form" hidden>
   <div id="form-target"></div>
-  <textarea id="form-text" placeholder="What should Claude change here? (Ctrl+Enter to save)"></textarea>
-  <div id="form-image" hidden><img alt="pasted screenshot" /><span>screenshot attached</span><button id="form-image-remove" title="Remove screenshot">&#10005;</button></div>
+  <textarea id="form-text" placeholder="What should Claude change here? (Ctrl+Enter to save · paste an image to attach a reference)"></textarea>
+  <div id="form-image" hidden><img alt="reference image" /><span>reference image attached</span><button id="form-image-remove" title="Remove reference image">&#10005;</button></div>
   <div id="form-actions">
     <button id="form-cancel">Cancel</button>
     <button id="form-save">Save</button>
@@ -308,12 +415,19 @@
   <div id="results-head"><span>&#10003; Changes applied</span><button id="results-close" title="Close">&#10005;</button></div>
   <div id="results-list"></div>
 </div>
+<div id="settings" hidden>
+  <div id="settings-head">&#9881; Per-agent instructions<button id="settings-close" title="Close">&#10005;</button></div>
+  <div id="settings-list">
+    <div id="settings-hint">Standing instructions attached to every batch you send to that agent (its <code>agentPrompt</code>). Saved on this machine for all projects.</div>
+  </div>
+  <div id="settings-actions"><button id="settings-save">Save</button></div>
+</div>
 <div id="toast" hidden></div>`;
   document.documentElement.appendChild(host);
 
   const $ = (id) => shadow.getElementById(id);
   const ui = {
-    toolbar: $('toolbar'), hide: $('btn-hide'), fab: $('fab'), fabBadge: $('fab-badge'),
+    toolbar: $('toolbar'), move: $('btn-move'), hide: $('btn-hide'), fab: $('fab'), fabBadge: $('fab-badge'),
     inspect: $('btn-inspect'), send: $('btn-send'), clear: $('btn-clear'), agentSelect: $('agent-select'),
     shot: $('btn-shot'),
     count: $('count'), dot: $('dot'), hoverBox: $('hover-box'), hoverLabel: $('hover-label'),
@@ -322,6 +436,8 @@
     formImage: $('form-image'), formImageRemove: $('form-image-remove'),
     toast: $('toast'), results: $('results'), resultsList: $('results-list'),
     resultsClose: $('results-close'), resultsToggle: $('btn-results-toggle'),
+    settings: $('settings'), settingsList: $('settings-list'), settingsHint: $('settings-hint'),
+    settingsOpen: $('btn-settings'), settingsClose: $('settings-close'), settingsSave: $('settings-save'),
   };
 
   let toastTimer;
@@ -347,14 +463,85 @@
     if (hidden) {
       setInspecting(false);
       closeForm();
+      ui.settings.hidden = true;
     }
     ui.toolbar.hidden = hidden;
     ui.fab.hidden = !hidden;
     try {
       localStorage.setItem(HIDDEN_KEY, hidden ? '1' : '');
     } catch {}
-    if (!hidden) pingBridge();
+    if (!hidden) {
+      restoreToolbarPos();
+      pingBridge();
+    }
   }
+
+  // ------------------------------------------------------------ drag / move
+  //
+  // The toolbar defaults to the bottom-right corner; the user can drag it
+  // anywhere by the ⠿ grip. Position is stored per-port and re-clamped to the
+  // viewport on load and resize so it never ends up off-screen.
+
+  const POS_KEY = `claude-annotator-pos-${PORT}`;
+
+  function clampPos(x, y) {
+    const r = ui.toolbar.getBoundingClientRect();
+    const maxX = Math.max(0, innerWidth - r.width);
+    const maxY = Math.max(0, innerHeight - r.height);
+    return { x: Math.min(Math.max(0, x), maxX), y: Math.min(Math.max(0, y), maxY) };
+  }
+
+  function applyToolbarPos(x, y) {
+    ui.toolbar.classList.add('moved');
+    ui.toolbar.style.left = `${x}px`;
+    ui.toolbar.style.top = `${y}px`;
+  }
+
+  function restoreToolbarPos() {
+    let p = null;
+    try {
+      p = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
+    } catch {}
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+    const c = clampPos(p.x, p.y);
+    applyToolbarPos(c.x, c.y);
+  }
+
+  let drag = null;
+  ui.move.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const r = ui.toolbar.getBoundingClientRect();
+    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    ui.toolbar.classList.add('dragging');
+    ui.move.setPointerCapture(e.pointerId);
+  });
+  ui.move.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const c = clampPos(e.clientX - drag.dx, e.clientY - drag.dy);
+    applyToolbarPos(c.x, c.y);
+  });
+  function endDrag(e) {
+    if (!drag) return;
+    drag = null;
+    ui.toolbar.classList.remove('dragging');
+    try {
+      ui.move.releasePointerCapture(e.pointerId);
+    } catch {}
+    const r = ui.toolbar.getBoundingClientRect();
+    try {
+      localStorage.setItem(POS_KEY, JSON.stringify({ x: r.left, y: r.top }));
+    } catch {}
+  }
+  ui.move.addEventListener('pointerup', endDrag);
+  ui.move.addEventListener('pointercancel', endDrag);
+
+  addEventListener('resize', () => {
+    if (!ui.toolbar.classList.contains('moved') || ui.toolbar.hidden) return;
+    const r = ui.toolbar.getBoundingClientRect();
+    const c = clampPos(r.left, r.top);
+    applyToolbarPos(c.x, c.y);
+  });
 
   // ---------------------------------------------------------------- pins
 
@@ -597,17 +784,15 @@
     ui.formImage.querySelector('img').src = dataUrl || '';
   }
 
-  // Ctrl+V an image (e.g. a fresh screenshot) into the note textarea — it is
-  // attached to this annotation and saved to a file by the bridge, which
-  // replaces it with an `imagePath` the agent can open.
+  // Ctrl+V an image (e.g. a design mockup or an external screenshot) into the
+  // note textarea — it is attached to this annotation as a *reference image*
+  // and saved to a file by the bridge, which replaces it with an `imagePath`
+  // the agent can open. This is independent of the 📷 page-screenshot toggle:
+  // a pasted reference is always sent.
   ui.formText.addEventListener('paste', (e) => {
     const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
     if (!item) return;
     e.preventDefault();
-    if (!state.screenshots) {
-      toast('Screenshots are off — turn on the 📷 toggle in the toolbar to attach pasted images.');
-      return;
-    }
     const file = item.getAsFile();
     if (!file) return;
     const reader = new FileReader();
@@ -642,7 +827,7 @@
         h: Math.round(r.height),
       },
     };
-    if (state.screenshots && state.formImage) a.pastedImage = state.formImage;
+    if (state.formImage) a.pastedImage = state.formImage; // user's reference image
     state.annotations.push(a);
     addPin(a);
     updateCount();
@@ -691,17 +876,46 @@
 
   const AGENT_KEY = `claude-annotator-agent-${PORT}`;
   let agents = [];
+  // `selectedAgent` — not the live <select>.value — is the source of truth for
+  // where a batch is sent. Keeping it in a variable means a background refresh
+  // that rebuilds the <option>s can never silently change the target (the old
+  // bug: the ~20s poll repopulated the dropdown mid-interaction and Send went
+  // to whichever agent happened to land first, e.g. Antigravity).
+  let selectedAgent = null;
+  try {
+    selectedAgent = localStorage.getItem(AGENT_KEY) || null;
+  } catch {}
+  let agentSig = ''; // signature of the currently-rendered option list
 
   function agentLabel(id) {
     return (agents.find((a) => a.id === id) || {}).label || id;
   }
 
+  // Keep `selectedAgent` valid for the current list and reflect it in the
+  // <select> without disturbing the user's choice.
+  function syncSelectValue(list) {
+    if (!selectedAgent || !list.some((a) => a.id === selectedAgent)) {
+      // No valid saved pick (e.g. first run, or the bridge came up on a new
+      // port). Prefer Claude over "whatever agent is listed first" so a batch
+      // never silently defaults to an unexpected agent.
+      const fromDom = list.find((a) => a.id === ui.agentSelect.value);
+      const claude = list.find((a) => a.id === 'claude');
+      selectedAgent = (fromDom || claude || list[0] || {}).id || selectedAgent;
+    }
+    if (selectedAgent && ui.agentSelect.value !== selectedAgent) {
+      ui.agentSelect.value = selectedAgent;
+    }
+  }
+
   function populateAgentSelect(list) {
-    const prevValue = ui.agentSelect.value;
-    let stored = null;
-    try {
-      stored = localStorage.getItem(AGENT_KEY);
-    } catch {}
+    const sig = list.map((a) => `${a.id}${a.label || a.id}`).join('');
+    // Nothing to rebuild if the option set is identical — just re-assert the
+    // selected value. This is the common case on every poll.
+    if (sig === agentSig) return syncSelectValue(list);
+    // Never rebuild the <option>s while the user has the dropdown open/focused;
+    // doing so cancels their in-progress pick. Try again on the next poll.
+    if (shadow.activeElement === ui.agentSelect) return;
+    agentSig = sig;
     ui.agentSelect.innerHTML = '';
     for (const a of list) {
       const opt = document.createElement('option');
@@ -709,13 +923,12 @@
       opt.textContent = a.label || a.id;
       ui.agentSelect.appendChild(opt);
     }
-    const wanted = [stored, prevValue].find((v) => v && list.some((a) => a.id === v));
-    if (wanted) ui.agentSelect.value = wanted;
+    syncSelectValue(list);
   }
 
   async function refreshAgents() {
     try {
-      const res = await fetch(`${BRIDGE}/agents`);
+      const res = await bridgeFetch('/agents');
       if (!res.ok) throw new Error();
       const data = await res.json();
       if (Array.isArray(data.agents) && data.agents.length) {
@@ -728,10 +941,87 @@
   }
 
   ui.agentSelect.addEventListener('change', () => {
+    selectedAgent = ui.agentSelect.value;
     try {
-      localStorage.setItem(AGENT_KEY, ui.agentSelect.value);
+      localStorage.setItem(AGENT_KEY, selectedAgent);
     } catch {}
   });
+
+  // ------------------------------------------------- per-agent modifier prompts
+  //
+  // Standing instructions the user attaches to a specific agent ("always use
+  // Tailwind", "never touch shared components", ...). The source of truth is
+  // the bridge's registry (agents.json — survives across projects/browsers);
+  // localStorage is the offline fallback. Sent as `agentPrompt` on every batch
+  // and also injected server-side by the bridge.
+
+  const promptKey = (id) => `claude-annotator-prompt-${id}`;
+
+  function promptFor(id) {
+    const fromBridge = (agents.find((a) => a.id === id) || {}).prompt;
+    if (typeof fromBridge === 'string' && fromBridge) return fromBridge;
+    try {
+      return localStorage.getItem(promptKey(id)) || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function renderSettings() {
+    for (const row of ui.settingsList.querySelectorAll('.prompt-row')) row.remove();
+    for (const a of agents) {
+      const row = document.createElement('div');
+      row.className = 'prompt-row';
+      row.dataset.agent = a.id;
+      const label = document.createElement('label');
+      label.textContent = a.label || a.id;
+      const ta = document.createElement('textarea');
+      ta.placeholder = `Extra instructions sent with every batch to ${a.label || a.id} (optional)`;
+      ta.value = promptFor(a.id);
+      row.appendChild(label);
+      row.appendChild(ta);
+      ui.settingsList.appendChild(row);
+    }
+  }
+
+  async function saveSettings() {
+    let bridgeOk = true;
+    for (const row of ui.settingsList.querySelectorAll('.prompt-row')) {
+      const id = row.dataset.agent;
+      const prompt = row.querySelector('textarea').value.trim();
+      const entry = agents.find((a) => a.id === id);
+      if (entry) entry.prompt = prompt || undefined;
+      try {
+        if (prompt) localStorage.setItem(promptKey(id), prompt);
+        else localStorage.removeItem(promptKey(id));
+      } catch {}
+      try {
+        const res = await bridgeFetch('/agents/prompt', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ agent: id, prompt }),
+        });
+        if (!res.ok) throw new Error();
+      } catch {
+        bridgeOk = false;
+      }
+    }
+    ui.settings.hidden = true;
+    toast(bridgeOk ? 'Per-agent instructions saved ✓' : 'Saved locally — bridge offline, will apply when it is back.');
+  }
+
+  ui.settingsOpen.addEventListener('click', async () => {
+    if (!ui.settings.hidden) {
+      ui.settings.hidden = true;
+      return;
+    }
+    await refreshAgents();
+    renderSettings();
+    ui.results.hidden = true;
+    ui.settings.hidden = false;
+  });
+  ui.settingsClose.addEventListener('click', () => (ui.settings.hidden = true));
+  ui.settingsSave.addEventListener('click', saveSettings);
 
   // ---------------------------------------------------------------- send
 
@@ -748,12 +1038,15 @@
   }
 
   function buildPayload() {
+    const agent = selectedAgent || ui.agentSelect.value || 'claude';
+    const agentPrompt = promptFor(agent);
     return {
       url: location.href,
       title: document.title,
       sentAt: new Date().toISOString(),
       viewport: { w: innerWidth, h: innerHeight },
-      agent: ui.agentSelect.value || 'claude',
+      agent,
+      ...(agentPrompt ? { agentPrompt } : {}), // standing instructions for this agent
       screenshot: state.screenshots, // launcher captures a page screenshot when true
       annotations: state.annotations.map(({ el, ...rest }) => rest),
     };
@@ -767,7 +1060,7 @@
     const payload = buildPayload();
     const label = agentLabel(payload.agent);
     try {
-      const res = await fetch(`${BRIDGE}/annotations`, {
+      const res = await bridgeFetch('/annotations', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
@@ -834,8 +1127,8 @@
     setScreenshots(!state.screenshots);
     toast(
       state.screenshots
-        ? 'Screenshots ON — sends include a page screenshot, and you can paste images into annotation notes.'
-        : 'Screenshots OFF — nothing visual is captured or sent.'
+        ? 'Page screenshot ON — each send also attaches a full-page screenshot of the app. (Reference images you paste into a note are always sent, regardless of this.)'
+        : 'Page screenshot OFF — sends no longer include a full-page screenshot. You can still paste a reference image into any note.'
     );
   });
   ui.send.addEventListener('click', send);
@@ -850,9 +1143,10 @@
   ui.resultsClose.addEventListener('click', () => (ui.results.hidden = true));
   ui.resultsToggle.addEventListener('click', () => {
     if (ui.results.hidden && !ui.resultsList.children.length) {
-      toast('No changes reported yet — they appear here after Claude applies your annotations.');
+      toast('No changes reported yet — recently applied changes (with the agent + model that made them) appear here.');
       return;
     }
+    ui.settings.hidden = true;
     ui.results.hidden = !ui.results.hidden;
   });
 
@@ -872,10 +1166,22 @@
   function renderResult(r) {
     const batch = document.createElement('div');
     batch.className = 'result-batch';
-    if (r.at) {
+    if (r.at || r.agent) {
       const t = document.createElement('div');
       t.className = 'result-time';
-      t.textContent = new Date(r.at).toLocaleTimeString();
+      if (r.at) t.appendChild(document.createTextNode(new Date(r.at).toLocaleTimeString() + '  '));
+      if (r.agent) {
+        const who = document.createElement('span');
+        who.className = 'result-agent';
+        who.textContent = agentLabel(r.agent);
+        t.appendChild(who);
+      }
+      if (r.model) {
+        const mo = document.createElement('span');
+        mo.className = 'result-model';
+        mo.textContent = ` · ${r.model}`;
+        t.appendChild(mo);
+      }
       batch.appendChild(t);
     }
     if (r.message) {
@@ -910,12 +1216,15 @@
     ui.resultsList.scrollTop = ui.resultsList.scrollHeight;
   }
 
+  let pollTick = 0;
   async function poll() {
     if (document.hidden) return;
-    await refreshAgents();
+    // The agent registry changes rarely — refresh it every ~20s (and when the
+    // settings panel opens), not on every 4s results poll.
+    if (pollTick++ % 5 === 0) await refreshAgents();
     let data;
     try {
-      const res = await fetch(`${BRIDGE}/results?since=${renderedResult}`);
+      const res = await bridgeFetch(`/results?since=${renderedResult}`);
       if (!res.ok) throw new Error();
       data = await res.json();
       ui.dot.classList.add('on');
@@ -936,14 +1245,17 @@
       } catch {}
       ui.results.hidden = false;
       const n = fresh.reduce((sum, r) => sum + (r.items?.length || (r.message ? 1 : 0)), 0);
-      toast(`Claude applied ${n} change${n === 1 ? '' : 's'} — details in the panel.`);
+      // Attribute the toast to the reporting agent(s) — with its exact model
+      // when the report carried one.
+      const who = [...new Set(fresh.map((r) => (r.agent ? agentLabel(r.agent) + (r.model ? ` (${r.model})` : '') : null)).filter(Boolean))];
+      toast(`${who.length ? who.join(' + ') : 'Agent'} applied ${n} change${n === 1 ? '' : 's'} — details in the panel.`);
     }
   }
   poll();
   setInterval(poll, 4000);
 
   function pingBridge() {
-    fetch(`${BRIDGE}/ping`)
+    bridgeFetch('/ping')
       .then((r) => ui.dot.classList.toggle('on', r.ok))
       .catch(() => ui.dot.classList.remove('on'));
   }
@@ -953,7 +1265,15 @@
     startHidden = localStorage.getItem(HIDDEN_KEY) === '1';
   } catch {}
   if (startHidden) setToolbarHidden(true);
+  else restoreToolbarPos();
 
   // Exposed for the launcher's self-test; not used by the UI.
-  window.__claudeAnnotatorDebug = { componentInfo, cssPath };
+  window.__claudeAnnotatorDebug = {
+    componentInfo,
+    cssPath,
+    refreshAgents,
+    populateAgentSelect,
+    buildPayload,
+    getSelectedAgent: () => selectedAgent,
+  };
 })();

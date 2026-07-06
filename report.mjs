@@ -3,11 +3,13 @@
 // right inside the annotated page, exactly what Claude changed.
 //
 // Usage:
-//   node report.mjs --file results.json [--dir .claude-annotations] [--port N] [--agent <id>]
+//   node report.mjs --file results.json [--dir .claude-annotations] [--port N] [--agent <id>] [--model <model-id>]
 //   node report.mjs --message "Rounded the hero card corners" [...]
 //
 //   --agent defaults to "claude" — pass the same id you used with wait.mjs so
 //   the "Changes applied" panel can attribute the report to the right agent.
+//   --model is YOUR exact model id/name (e.g. claude-fable-5, gpt-5.2-codex) —
+//   it is shown next to your agent name in the browser's applied-changes panel.
 //
 // results.json shape (all fields optional except items[].summary):
 //   {
@@ -30,6 +32,7 @@ const dir = path.resolve(arg('dir', path.join(process.cwd(), '.claude-annotation
 const file = arg('file', null);
 const message = arg('message', null);
 const agent = arg('agent', 'claude');
+const model = arg('model', null);
 let port = Number(arg('port', 0));
 
 let payload;
@@ -47,6 +50,7 @@ if (file) {
   process.exit(1);
 }
 if (!payload.agent) payload.agent = agent;
+if (!payload.model && model) payload.model = model;
 
 if (!port) {
   try {

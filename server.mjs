@@ -18,12 +18,23 @@ import path from 'node:path';
 import { resolveAnnotations } from './resolve.mjs';
 import { createBridge, listenOnFreePort, writeBatch, writeBridgeInfo, clearBridgeInfo } from './bridge.mjs';
 import { makeArg } from './cli.mjs';
+import { findRunningBridge } from './client.mjs';
 
 const argv = process.argv.slice(2);
 const arg = makeArg(argv);
 const basePort = Number(arg('port', 4747));
 const outDir = path.resolve(arg('out-dir', path.join(process.cwd(), '.claude-annotations')));
 const once = argv.includes('--once');
+
+// Singleton per project: reuse a live bridge for this directory instead of
+// failing on the taken port (or worse, racing it).
+const running = await findRunningBridge(outDir);
+if (running) {
+  console.log(`[server] bridge already running for this project (port ${running.port}${running.pid ? `, pid ${running.pid}` : ''}) — reusing it.`);
+  console.log(`BRIDGE_PORT=${running.port}`);
+  console.log('ALREADY_RUNNING=1');
+  process.exit(0);
+}
 
 let batches = 0;
 

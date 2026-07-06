@@ -46,6 +46,7 @@ export function loadAgents() {
 }
 
 // Add a new agent or refresh an existing one's install timestamp/label.
+// An existing entry's modifier prompt is preserved.
 export function registerAgent(id, label) {
   const agents = loadAgents();
   const existing = agents.find((a) => a.id === id);
@@ -56,6 +57,23 @@ export function registerAgent(id, label) {
   } else {
     agents.push({ id, label, installedAt });
   }
+  saveAgents(agents);
+  return agents;
+}
+
+// Save an agent's modifier prompt — standing instructions the bridge attaches
+// to every batch addressed to that agent (`agentPrompt` in the batch JSON).
+// An empty prompt clears it. Unknown ids are registered on the fly.
+export function setAgentPrompt(id, prompt) {
+  const agents = loadAgents();
+  let entry = agents.find((a) => a.id === id);
+  if (!entry) {
+    entry = { id, label: labelFor(id), installedAt: new Date().toISOString() };
+    agents.push(entry);
+  }
+  const trimmed = (prompt || '').trim();
+  if (trimmed) entry.prompt = trimmed;
+  else delete entry.prompt;
   saveAgents(agents);
   return agents;
 }

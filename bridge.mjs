@@ -4,16 +4,18 @@
 //
 // Endpoints:
 //   GET  /ping                 liveness (extension green dot)
-//   GET  /agents                registered agents for the "Send to" dropdown
+//   GET  /agents                registered agents for the "Send to" dropdown (incl. per-agent prompts)
+//   POST /agents/prompt        save an agent's modifier prompt { agent, prompt }
 //   POST /annotations          extension sends a batch (tagged `agent`) -> onBatch(data) writes it
 //   GET  /wait?agent=X         long-poll: responds with the next unclaimed batch for that agent
-//   POST /results              agent posts what it changed (optionally tagged `agent`)
+//   POST /results              agent posts what it changed (tagged `agent`, `model`)
 //   GET  /results?since=N      extension polls for reports newer than N (all agents)
+//   POST /command              agent drives the browser (screenshot/navigate/reload) — needs a launcher with Playwright
 //   GET  /state                debug snapshot
 import { createServer } from 'node:http';
 import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { loadAgents } from './agents.mjs';
+import { loadAgents, setAgentPrompt } from './agents.mjs';
 
 const MAX_RESULTS = 50;
 // Unclaimed-batch caps: new POSTs are rejected with 429 { error: "queue_full" }
@@ -36,11 +38,14 @@ function readBody(req) {
 }
 
 // onBatch(data) -> file path the batch was written to (may be async).
+// onCommand(cmd) -> result object; drives the browser (screenshot/navigate/
+//   reload). Only the Playwright launcher supplies it; when absent, /command
+//   returns 501 so a standalone bridge (server.mjs) reports the limitation.
 // `dir` is the bridge's output directory; when given, agent-seen state is
 // persisted to <dir>/agents.json so it survives bridge restarts.
-export function createBridge({ onBatch, log = console.log, dir = null }) {
+export function createBridge({ onBatch, onCommand = null, log = console.log, dir = null }) {
   const batches = []; // { n, file, count, url, agent, claimed }
-  const results = []; // { id, at, agent, message, items }
+  const results = []; // { id, at, agent, model, message, items }
   let batchSeq = 0;
   let resultSeq = 0;
   const waiters = new Set(); // parked /wait responses: { res, agent }
@@ -56,6 +61,31 @@ export function createBridge({ onBatch, log = console.log, dir = null }) {
         if (Number.isFinite(t)) agentSeen.set(a, t);
       }
     } catch {}
+  }
+
+  // Applied-change reports survive bridge restarts, so the extension's
+  // "recently applied changes" panel keeps its history across sessions.
+  const resultsFile = dir ? path.join(dir, 'results.json') : null;
+  if (resultsFile && existsSync(resultsFile)) {
+    try {
+      const saved = JSON.parse(readFileSync(resultsFile, 'utf8'));
+      for (const r of Array.isArray(saved.results) ? saved.results : []) {
+        if (r && Number.isFinite(r.id)) {
+          results.push(r);
+          resultSeq = Math.max(resultSeq, r.id);
+        }
+      }
+    } catch {}
+  }
+
+  function persistResults() {
+    if (!resultsFile) return;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(resultsFile, JSON.stringify({ results }, null, 2));
+    } catch (e) {
+      log(`[bridge] could not persist results to ${resultsFile}: ${e.message}`);
+    }
   }
 
   function persistSeen() {
@@ -120,10 +150,31 @@ export function createBridge({ onBatch, log = console.log, dir = null }) {
       return json(res, 200, { agents: loadAgents() });
     }
 
+    // Save a per-agent modifier prompt (standing instructions attached to
+    // every batch sent to that agent) — the extension's ⚙ settings panel.
+    if (req.method === 'POST' && url.pathname === '/agents/prompt') {
+      try {
+        const data = JSON.parse(await readBody(req));
+        if (typeof data.agent !== 'string' || !data.agent) throw new Error('missing agent');
+        setAgentPrompt(data.agent, typeof data.prompt === 'string' ? data.prompt : '');
+        log(`[bridge] saved modifier prompt for "${data.agent}" (${(data.prompt || '').length} chars)`);
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        res.writeHead(400);
+        return res.end(String(e));
+      }
+    }
+
     if (req.method === 'POST' && url.pathname === '/annotations') {
       try {
         const data = JSON.parse(await readBody(req));
         const agent = typeof data.agent === 'string' && data.agent ? data.agent : 'claude';
+        // Attach the agent's saved modifier prompt so it always travels with
+        // the batch, even when the sending extension is older.
+        if (!data.agentPrompt) {
+          const entry = loadAgents().find((a) => a.id === agent);
+          if (entry?.prompt) data.agentPrompt = entry.prompt;
+        }
         // Reject when the unclaimed queue is full (per agent or bridge-wide)
         // instead of piling up batches nobody is draining.
         const queuedForAgent = batches.filter((b) => !b.claimed && b.agent === agent).length;
@@ -192,14 +243,16 @@ export function createBridge({ onBatch, log = console.log, dir = null }) {
           id: ++resultSeq,
           at: new Date().toISOString(),
           agent: typeof data.agent === 'string' && data.agent ? data.agent : null,
+          model: typeof data.model === 'string' && data.model ? data.model : null,
           message: typeof data.message === 'string' ? data.message : null,
           items: Array.isArray(data.items) ? data.items : [],
         };
         results.push(entry);
         if (entry.agent) markSeen(entry.agent);
         if (results.length > MAX_RESULTS) results.splice(0, results.length - MAX_RESULTS);
+        persistResults();
         json(res, 200, { ok: true, id: entry.id });
-        log(`[bridge] report #${entry.id}${entry.agent ? ` (${entry.agent})` : ''}: ${entry.items.length} item(s)${entry.message ? ` — ${entry.message}` : ''}`);
+        log(`[bridge] report #${entry.id}${entry.agent ? ` (${entry.agent}${entry.model ? ` · ${entry.model}` : ''})` : ''}: ${entry.items.length} item(s)${entry.message ? ` — ${entry.message}` : ''}`);
       } catch (e) {
         res.writeHead(400);
         res.end(String(e));
@@ -210,6 +263,34 @@ export function createBridge({ onBatch, log = console.log, dir = null }) {
     if (req.method === 'GET' && url.pathname === '/results') {
       const since = Number(url.searchParams.get('since')) || 0;
       return json(res, 200, { latest: resultSeq, results: results.filter((r) => r.id > since) });
+    }
+
+    // Agent-driven browser control: crop a screenshot of an exact area,
+    // navigate to another route, or reload after applying edits. Handled by
+    // the launcher's Playwright page; unsupported on a browser-less bridge.
+    if (req.method === 'POST' && url.pathname === '/command') {
+      let data;
+      try {
+        data = JSON.parse(await readBody(req));
+      } catch (e) {
+        res.writeHead(400);
+        return res.end('bad json');
+      }
+      if (typeof onCommand !== 'function') {
+        return json(res, 501, {
+          error: 'unsupported',
+          message:
+            'This bridge has no browser control — it was started without Playwright (server.mjs / your own Chrome). Only the launch.mjs launcher can screenshot, navigate, or reload.',
+        });
+      }
+      try {
+        const result = (await onCommand(data)) || {};
+        log(`[bridge] command "${data.type}" ok${result.path ? ` -> ${result.path}` : result.url ? ` -> ${result.url}` : ''}`);
+        return json(res, 200, { ok: true, ...result });
+      } catch (e) {
+        log(`[bridge] command "${data?.type}" failed: ${e.message}`);
+        return json(res, 500, { error: 'command_failed', message: e.message });
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/state') {
@@ -258,9 +339,11 @@ export function listenOnFreePort(server, basePort, tries = 10) {
 // Write a batch to <dir>/<agent>/inbox/<timestamp>.json and
 // <dir>/<agent>/latest.json — each agent gets its own queue so multiple
 // agents can run wait.mjs concurrently without stealing each other's batches.
-// Images the user pasted into annotations arrive as data URLs; they are
-// written to <dir>/<agent>/shots/ and replaced with an `imagePath` the
-// consuming agent can open directly.
+// Reference images the user pasted into annotations arrive as data URLs; they
+// are written to <dir>/<agent>/shots/ (named `*-reference` so they are never
+// confused with page screenshots) and replaced with an `imagePath` the
+// consuming agent can open directly, plus `imageKind: 'reference'` so it knows
+// this is a user-supplied reference — NOT a screenshot of the current page.
 export function writeBatch(data, dir, agent = 'claude') {
   const agentDir = path.join(dir, agent);
   mkdirSync(path.join(agentDir, 'inbox'), { recursive: true });
@@ -272,9 +355,10 @@ export function writeBatch(data, dir, agent = 'claude') {
     if (m) {
       const shotsDir = path.join(agentDir, 'shots');
       mkdirSync(shotsDir, { recursive: true });
-      const imgFile = path.join(shotsDir, `${stamp}-a${a.id}.${m[1] === 'jpeg' ? 'jpg' : m[1]}`);
+      const imgFile = path.join(shotsDir, `${stamp}-a${a.id}-reference.${m[1] === 'jpeg' ? 'jpg' : m[1]}`);
       writeFileSync(imgFile, Buffer.from(m[2], 'base64'));
       a.imagePath = imgFile;
+      a.imageKind = 'reference';
     }
     delete a.pastedImage;
   }

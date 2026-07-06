@@ -13,10 +13,11 @@
 //               different AI coding agent (opencode, codex, antigravity, ...)
 //               being asked to install this tool, pass your own name here —
 //               e.g. `node install.mjs --agent codex` — so you show up in
-//               the browser's "Send to" list under your own name. Only
-//               "claude" gets the full /annotate skill below; other agents
-//               are registered but consume batches via wait.mjs/report.mjs
-//               directly (pass the same --agent id to both).
+//               the browser's "Send to" list under your own name. Every agent
+//               gets an /annotate skill: "claude" gets skill/SKILL.md, all
+//               others get skill/AGENT_SKILL.md rendered into their native
+//               custom-command location (OpenCode/Codex) or agents/<id>.md
+//               here, built around the one-command loop `agent.mjs`.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -44,31 +45,58 @@ if (!noDeps) {
 
 // ---------------------------------------------------------------- skill
 
+function renderTemplate(file, agentId) {
+  const rendered = readFileSync(path.join(HERE, 'skill', file), 'utf8')
+    .replaceAll('{{ANNOTATOR_DIR}}', HERE.replaceAll('\\', '/'))
+    .replaceAll('{{AGENT_ID}}', agentId)
+    .replaceAll('{{AGENT_LABEL}}', labelFor(agentId));
+  if (!rendered.includes(HERE.replaceAll('\\', '/'))) {
+    console.error(`[install] template rendering failed — {{ANNOTATOR_DIR}} not substituted in ${file}`);
+    process.exit(1);
+  }
+  return rendered;
+}
+
 if (agentId === 'claude') {
   const skillsRoot = project
     ? path.join(process.cwd(), '.claude', 'skills')
     : path.join(os.homedir(), '.claude', 'skills');
   const dest = path.join(skillsRoot, 'annotate');
 
-  const template = readFileSync(path.join(HERE, 'skill', 'SKILL.md'), 'utf8');
-  const rendered = template.replaceAll('{{ANNOTATOR_DIR}}', HERE.replaceAll('\\', '/'));
-  if (!rendered.includes(HERE.replaceAll('\\', '/'))) {
-    console.error('[install] template rendering failed — {{ANNOTATOR_DIR}} not substituted');
-    process.exit(1);
-  }
   mkdirSync(dest, { recursive: true });
-  writeFileSync(path.join(dest, 'SKILL.md'), rendered);
+  writeFileSync(path.join(dest, 'SKILL.md'), renderTemplate('SKILL.md', agentId));
 
   console.log(`[install] skill installed: ${path.join(dest, 'SKILL.md')}`);
   console.log(`[install] launcher path baked in: ${HERE}`);
   console.log('[install] restart Claude Code (or open a new session) and run /annotate.');
 } else {
-  console.log(
-    `[install] "${agentId}" doesn't have a dedicated skill/command wired up here yet — ` +
-      `skipping that step. You can still consume annotation batches directly:`
-  );
-  console.log(`  node "${path.join(HERE, 'wait.mjs')}" --dir <project>/.claude-annotations --agent ${agentId}`);
-  console.log(`  node "${path.join(HERE, 'report.mjs')}" --dir <project>/.claude-annotations --agent ${agentId} --file results.json`);
+  // Every other agent gets the generic one-command skill (agent.mjs loop),
+  // written into its native custom-command location when we know it.
+  const home = os.homedir();
+  const dests =
+    agentId === 'opencode'
+      ? [
+          project
+            ? path.join(process.cwd(), '.opencode', 'command', 'annotate.md')
+            : path.join(home, '.config', 'opencode', 'command', 'annotate.md'),
+        ]
+      : agentId === 'codex'
+        ? [path.join(home, '.codex', 'prompts', 'annotate.md')]
+        : [path.join(HERE, 'agents', `${agentId}-annotate.md`)];
+
+  const rendered = renderTemplate('AGENT_SKILL.md', agentId);
+  for (const dest of dests) {
+    mkdirSync(path.dirname(dest), { recursive: true });
+    writeFileSync(dest, rendered);
+    console.log(`[install] skill installed: ${dest}`);
+  }
+  if (agentId === 'opencode' || agentId === 'codex') {
+    console.log(`[install] restart ${labelFor(agentId)} and run /annotate.`);
+  } else {
+    console.log(`[install] wire that file into ${labelFor(agentId)}'s custom command/skill mechanism (or just follow it directly).`);
+  }
+  console.log('[install] the whole loop is one repeatable command:');
+  console.log(`  node "${path.join(HERE, 'agent.mjs')}" --agent ${agentId} --dir <project>/.claude-annotations --url <dev-url>`);
 }
 
 // ---------------------------------------------------------------- registry

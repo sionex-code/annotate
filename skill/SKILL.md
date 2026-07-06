@@ -51,7 +51,11 @@ The launcher is **persistent**: it keeps the browser and bridge alive for the
 whole session and accepts any number of batches. It prints
 `BRIDGE_PORT=<port>` and writes `<dir>/bridge.json` (used by the helper
 scripts below), and it only exits when the browser is closed (exit 0 if
-batches were received, 2 if none) — that exit means the session is over.
+batches were received, 2 if none) — that exit means the session is over,
+with ONE exception: if it prints `ALREADY_RUNNING=1`, an annotator session
+for this project is already live (possibly started by another agent) and is
+being **reused** — the immediate exit does NOT mean the session ended. Never
+try to launch again; just continue to step 3.
 If it fails because Chromium is missing, run
 `npx --prefix "{{ANNOTATOR_DIR}}" playwright install chromium` and retry.
 
@@ -79,7 +83,10 @@ Exit codes:
 
 ## 4. Process the annotations
 
-Read the `ANNOTATIONS_FILE` JSON. For each entry in `annotations[]`:
+Read the `ANNOTATIONS_FILE` JSON. If the top level has an `agentPrompt`
+string, those are the user's saved standing instructions for Claude (set via
+the extension's ⚙ panel) — apply them to **every** annotation in the batch.
+For each entry in `annotations[]`:
 
 - `prompt` — what the user wants changed for that element.
 - `jsxSource` — file:line of the clicked element's JSX (sourcemap-resolved,
@@ -100,13 +107,35 @@ Read the `ANNOTATIONS_FILE` JSON. For each entry in `annotations[]`:
   or list directories.
 - `selector`, `text`, `html` — to pinpoint the exact JSX inside the file.
 - `url` — which route/page the user was on.
-- `imagePath` (optional, only when the user's 📷 screenshots toggle is on) —
-  absolute path of an image the user pasted onto this annotation (e.g. a
-  cropped screenshot or a design reference). Read the image file to see it.
-- Top-level `screenshotPath` (optional, same toggle) — absolute path of a
-  full-page screenshot taken when the batch was sent; each annotation's
-  `rect` gives its page coordinates within it. Read it when the prompts need
-  visual context; skip it when the text is already unambiguous.
+- `imagePath` (optional) — absolute path of a **reference image the user
+  pasted onto this annotation** (`imageKind: "reference"`), e.g. a design
+  mockup or an external screenshot. This is the user's supplied reference —
+  it is **NOT** a screenshot of the current page. Read the image file to see
+  what they want. Always sent when present, regardless of the 📷 toggle.
+- Top-level `screenshotPath` (optional, only when the user's 📷 page-screenshot
+  toggle is on) — absolute path of an actual **full-page screenshot of the
+  app** taken when the batch was sent; each annotation's `rect` gives its page
+  coordinates within it. Read it when the prompts need visual context; skip it
+  when the text is already unambiguous.
+
+### Need to SEE the page? Drive the browser yourself
+
+You don't have to wait for the user — you can control the same Playwright
+browser directly (via `browse.mjs`) to get exactly the pixels you need:
+
+```sh
+# a tight crop of one annotation's element (uses its selector — always in frame)
+node "{{ANNOTATOR_DIR}}/browse.mjs" shot --dir "<PROJECT_DIR>/.claude-annotations" --annotation <ANNOTATIONS_FILE> --id <annotation id>
+node "{{ANNOTATOR_DIR}}/browse.mjs" shot --dir "..." --selector "<css selector>"   # any element
+node "{{ANNOTATOR_DIR}}/browse.mjs" shot --dir "..." --full                        # whole page
+node "{{ANNOTATOR_DIR}}/browse.mjs" open --dir "..." --url <url>                    # go to another route
+node "{{ANNOTATOR_DIR}}/browse.mjs" reload --dir "..."                              # reload after edits
+```
+
+`shot` prints `SCREENSHOT=<path>` — read that image file. `open`/`reload`
+print `PAGE_URL=<url>`. This is the fast way to verify a change landed, inspect
+an exact area referenced in a prompt, or move to the page an annotation is
+about. (Only works with the Playwright launcher, not a hand-loaded extension.)
 
 Implement each annotation's change, respecting this project's agent
 delegation policy if one exists (e.g. frontend work may need to go through a
@@ -131,15 +160,17 @@ batch, show them what happened. Write a results file (e.g.
 
 `id` matches the annotation number (its red pin), `status` is
 `done | failed | skipped`, `summary` is plain words (no HTML/code dumps),
-`files` lists the files touched. Then deliver it:
+`files` lists the files touched. Then deliver it — `--model` must be **your
+exact model id** as stated in your system prompt (e.g. `claude-fable-5`),
+never a guess or a family name:
 
 ```sh
-node "{{ANNOTATOR_DIR}}/report.mjs" --dir "<PROJECT_DIR>/.claude-annotations" --agent claude --file <results file>
+node "{{ANNOTATOR_DIR}}/report.mjs" --dir "<PROJECT_DIR>/.claude-annotations" --agent claude --model <your-exact-model-id> --file <results file>
 ```
 
-The extension shows it in a "✓ Changes applied" panel on the page (the dev
-server hot-reloads the visual changes themselves). Also summarize the same
-things in chat, per annotation number.
+The extension shows it in a "✓ Changes applied" panel on the page, attributed
+to your agent + model (the dev server hot-reloads the visual changes
+themselves). Also summarize the same things in chat, per annotation number.
 
 ## 6. Loop
 

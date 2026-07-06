@@ -1,54 +1,106 @@
 # Claude Annotator
 
-Point at your running app, describe changes visually, and hand your AI coding
-agent (Claude Code, and now also OpenCode, Codex, Antigravity, or "whatever
-agent we install") the **exact component files** — no broad codebase reading,
-far fewer tokens.
+Point at your **running app** in the browser, click on things, describe what
+should change in plain words — and hand your AI coding agent (Claude Code,
+OpenCode, Codex, Antigravity, or "whatever agent we install") the **exact
+component file and line** to edit. No broad codebase crawling, far fewer
+tokens burned figuring out "where is this button rendered."
 
-Two parts:
+Built for **Next.js** first (it resolves React Server Component chains and
+Turbopack/webpack sourcemaps out of the box), but it works with **any
+React app** — Vite, CRA, Remix — and degrades gracefully to selector + HTML
+snippet targeting for non-React pages too.
 
-1. **`extension/`** — a Chrome (MV3) extension that runs on `localhost` pages.
-   It adds a toolbar (bottom-right) with an element picker. For every element
-   you click it captures:
-   - your change request (the prompt you type),
-   - the page URL,
-   - a CSS selector + a snippet of the element's HTML/text,
-   - the **React component chain** (walked via `_debugOwner`, supporting both
-     client fibers and React Server Component info objects), and
-   - **creation-site stack frames** (`_debugSource` on React ≤18,
-     `_debugStack` on React 19).
-2. **`launch.mjs`** — a Node script used by the `/annotate` Claude Code skill.
-   It starts a tiny HTTP bridge on `localhost:4747`, launches Playwright's
-   Chromium with the extension loaded, and opens your dev server. When you
-   pick a target agent and click **Send**, `resolve.mjs` maps the
-   compiled-chunk stack frames back to original files via sourcemaps (works
-   with Turbopack and webpack dev builds, including React Server
-   Components), producing exact targets like
-   `src/components/site/search-box.tsx:66`. Each batch is written to
+## Why this is useful
+
+Normally, describing a UI tweak to an agent means it has to go hunting:
+grep for text, guess the component, read half the codebase, maybe edit the
+wrong file because three components render similar-looking cards. That's
+slow and expensive in tokens.
+
+Claude Annotator skips all of that. A small Chrome extension runs on your
+`localhost` dev server. You click **Annotate**, click any element on the
+page, and type your request:
+
+![Annotating multiple elements on a page](docs/images/annotate-multi.png)
+
+For every element you click, the extension captures:
+
+- your change request (the prompt you typed),
+- the page URL,
+- a CSS selector + a snippet of the element's HTML/text,
+- the **React component chain** (walked via `_debugOwner`, works for both
+  client fiber components and React Server Components), and
+- **creation-site stack frames**, resolved through sourcemaps back to your
+  original source — even through Turbopack/webpack dev builds — producing an
+  exact target like `src/components/site/search-box.tsx:66`.
+
+You can drop **as many annotations as you want** in one page, on multiple
+elements, even move a pin if you clicked the wrong spot:
+
+![Repositioning an annotation before sending](docs/images/annotate-move.png)
+
+Then pick your target agent from the toolbar dropdown and hit **Send ➤**.
+That's the second big idea: this isn't Claude-only. The same toolbar can
+route a batch to **Claude, Codex, OpenCode, Antigravity, or any agent you've
+installed the tool for** — each gets its own queue, so you can run more than
+one agent against different batches without them stepping on each other.
+
+The agent reads the batch, jumps **straight to the referenced file and
+line** — no exploration — implements the change, and reports back into the
+page itself:
+
+![Changes applied panel showing which file was touched](docs/images/annotate-report.png)
+
+The "✓ Changes applied" panel shows exactly what changed, which files were
+touched, and which agent + model did it — so you never have to tab back to
+a terminal to know if it worked. The dev server hot-reloads the visual
+result automatically.
+
+## Why it's not just a Next.js thing
+
+Everything above works on any React app because the component-chain and
+sourcemap resolution only depend on React's own dev-mode debug info
+(`_debugOwner` / `_debugSource` / `_debugStack`), not on Next.js internals.
+Next.js just happens to be where the token-savings payoff is biggest, since
+big app-router pages often inline many sections in one file — an exact
+`file:line` target matters even more there. Point it at a Vite or CRA app
+and you get the same exact-file targeting; point it at a non-React page and
+you still get selector + HTML snippet targeting, which is enough for most
+CSS/copy tweaks.
+
+## How it works, in two parts
+
+1. **`extension/`** — a Chrome (MV3) extension that runs on `localhost`
+   pages. Adds a small draggable toolbar with an element picker, an agent
+   dropdown, a "✓ Changes applied" history panel, and a ⚙ per-agent
+   instructions panel.
+2. **`launch.mjs`** — a Node script used by the `/annotate` agent skill. It
+   starts a tiny HTTP bridge on `localhost:4747`, launches Playwright's
+   Chromium with the extension loaded, and opens your dev server. Each
+   batch you send is written to
    `.claude-annotations/<agent>/inbox/<timestamp>.json` (+ `latest.json`) —
-   one queue per agent, so more than one can run concurrently — and the
-   session **keeps running**: annotate and send as many batches as you like;
-   closing the browser ends it (`--once` restores the old single-shot
-   behavior).
+   one queue per agent — and the session **keeps running**: annotate and
+   send as many batches as you like; closing the browser ends it.
 
 Around them, small helpers close the loop with whichever agent you send to:
 
-- **`agents.mjs`** — the registry of agents that have installed this tool
-  (`agents.json`, seeded with `claude` by default). `install.mjs` adds an
-  entry when an agent installs itself; the extension reads `/agents` to
-  populate its "Send to" dropdown.
-- **`wait.mjs --agent <id>`** — blocks until the next batch addressed to
-  `<id>` arrives, prints `ANNOTATIONS_FILE=...` and exits. Run it in the
-  background and get woken up per batch, so new annotations are picked up
-  automatically.
-- **`report.mjs --agent <id>`** — posts a JSON summary of what the agent
-  changed back to the bridge; the extension renders it in a **"✓ Changes
-  applied"** panel on the page (per annotation: status, plain-words summary,
-  files touched).
+- **`agent.mjs --agent <id>`** — one-command loop: reuse/launch the
+  browser, wait for the next batch addressed to `<id>`, print the batch plus
+  a literal implement → report → re-run checklist.
+- **`agents.mjs`** / `agents.json` — the registry of agents that have
+  installed this tool; each entry can carry a per-agent **modifier prompt**
+  (standing instructions) attached to every batch sent to it.
+- **`wait.mjs --agent <id>`** — blocks until the next batch for `<id>`
+  arrives.
+- **`report.mjs --agent <id> --model <model-id>`** — posts a JSON summary of
+  what was changed back to the bridge; rendered as the "✓ Changes applied"
+  panel, attributed to the agent **and its exact model**.
+- **`browse.mjs`** — lets the agent drive the browser itself: crop a
+  screenshot of any annotation's element, navigate, or reload — without the
+  user doing anything.
 - **`bridge.mjs`** — the shared HTTP bridge used by `launch.mjs` and
-  `server.mjs` (`/agents` registry, `/annotations` intake tagged by agent,
-  `/wait?agent=` long-poll, `/results` reports). The active port is
-  discoverable via `.claude-annotations/bridge.json`.
+  `server.mjs`.
 
 ## Install (one command)
 
@@ -56,12 +108,18 @@ Around them, small helpers close the loop with whichever agent you send to:
 cd claude-annotator
 node install.mjs            # installs deps + the /annotate skill for all projects (registers as "claude")
 node install.mjs --project  # ...or into the current project's .claude/skills only
-node install.mjs --agent codex --no-deps   # a different agent registering itself
+node install.mjs --agent opencode   # another agent: registers it AND installs its /annotate command
 ```
 
-The installer bakes this folder's current location into the skill, so you can
-move or copy the directory anywhere (or to another machine) and just re-run it.
-Add `--no-deps` to skip the npm / Playwright Chromium checks.
+Non-Claude agents get the generic one-command skill (`skill/AGENT_SKILL.md`)
+written into their native location — OpenCode:
+`~/.config/opencode/command/annotate.md` (or `.opencode/command/` with
+`--project`), Codex: `~/.codex/prompts/annotate.md`, anything else:
+`agents/<id>-annotate.md` in this folder.
+
+The installer bakes this folder's current location into the skill, so you
+can move or copy the directory anywhere (or to another machine) and just
+re-run it. Add `--no-deps` to skip the npm / Playwright Chromium checks.
 
 > **For Claude / AI agents:** to install this tool, run `node install.mjs`
 > in this directory, then tell the user to restart Claude Code so the
@@ -72,8 +130,7 @@ Add `--no-deps` to skip the npm / Playwright Chromium checks.
 > anything else) being pointed at this folder and asked to install it: read
 > **[`AGENTS.md`](./AGENTS.md)** in this directory — it's a self-contained,
 > agent-agnostic install + wait/implement/report loop written for exactly
-> this situation (many agents, including OpenCode and Codex, auto-read
-> `AGENTS.md` files, so it's the more reliable entry point than this prose).
+> this situation.
 
 > Branded Google Chrome ≥137 ignores `--load-extension`, which is why the
 > launcher uses Playwright's Chromium build.
@@ -140,10 +197,28 @@ payload to your clipboard so you can paste it into your agent manually.
   snippet); the technical details (selector, HTML, file:line) still travel in
   the payload for the target agent — they are just not displayed.
 - The green dot in the toolbar means the bridge is reachable.
+- **Drag the toolbar** by the ⠿ grip on its left to move it anywhere; the
+  position is remembered per-port.
+- Paste an image into a note (`Ctrl+V`) to attach a **reference image** (a
+  mockup / external screenshot) to that annotation — always sent, arriving as
+  `imagePath` with `imageKind: "reference"`. The 📷 toggle is separate: it adds
+  a full-page **screenshot of the app** (`screenshotPath`) to each send.
+- Agents can drive the browser themselves via `browse.mjs` (see above) — crop
+  an exact area, navigate, or reload — without the user doing anything.
 - The agent dropdown is populated from `agents.json` (via the bridge's
   `/agents` endpoint) and remembers your last pick per-port in localStorage.
+- The ⚙ button opens **per-agent instructions**: a saved modifier prompt per
+  agent, attached to every batch sent to it (as `agentPrompt`). Stored in
+  `agents.json` via the bridge (with a localStorage fallback), so it applies
+  across projects.
+- The ✓ button shows **recently applied changes** — each batch is attributed
+  to the agent that made it and the exact model it reported via
+  `report.mjs --model`; history survives bridge restarts.
 - `Esc` exits picker mode; `Ctrl+Enter` saves the annotation form.
 - Launcher flags: `--url`, `--dir`, `--out` (legacy), `--port`, `--headless`,
-  `--once`.
+  `--once`. If a session is already live for the project it prints
+  `ALREADY_RUNNING=1` and reuses it instead of opening a second browser.
 - `wait.mjs`/`report.mjs` both take `--agent <id>` (default `claude`) to
-  scope them to one agent's queue.
+  scope them to one agent's queue; `report.mjs --model <id>` attributes the
+  report to the agent's exact model; `wait.mjs --timeout <sec>` exits 4
+  instead of blocking forever (for agents without background shells).
